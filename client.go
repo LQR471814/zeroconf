@@ -34,6 +34,11 @@ type clientOpts struct {
 // ClientOption fills the option struct to configure intefaces, etc.
 type ClientOption func(*clientOpts)
 
+type ClientMsg struct {
+	Msg  *dns.Msg
+	Addr net.Addr
+}
+
 // SelectIPTraffic selects the type of IP packets (IPv4, IPv6, or both) this
 // instance listens for.
 // This does not guarantee that only mDNS entries of this sepcific
@@ -180,7 +185,7 @@ func newClient(opts clientOpts) (*client, error) {
 // Start listeners and waits for the shutdown signal from exit channel
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
-	msgCh := make(chan *dns.Msg, 32)
+	msgCh := make(chan ClientMsg, 32)
 	if c.ipv4conn != nil {
 		go c.recv(ctx, c.ipv4conn, msgCh)
 	}
@@ -200,8 +205,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			return
 		case msg := <-msgCh:
 			entries = make(map[string]*ServiceEntry)
-			sections := append(msg.Answer, msg.Ns...)
-			sections = append(sections, msg.Extra...)
+			sections := append(msg.Msg.Answer, msg.Msg.Ns...)
+			sections = append(sections, msg.Msg.Extra...)
 
 			for _, answer := range sections {
 				switch rr := answer.(type) {
@@ -217,6 +222,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 							trimDot(strings.Replace(rr.Ptr, rr.Hdr.Name, "", -1)),
 							params.Service,
 							params.Domain)
+
+						entries[rr.Ptr].TrueAddr = msg.Addr
 					}
 					entries[rr.Ptr].TTL = rr.Hdr.Ttl
 				case *dns.SRV:
@@ -230,6 +237,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 							trimDot(strings.Replace(rr.Hdr.Name, params.ServiceName(), "", 1)),
 							params.Service,
 							params.Domain)
+
+						entries[rr.Hdr.Name].TrueAddr = msg.Addr
 					}
 					entries[rr.Hdr.Name].HostName = rr.Target
 					entries[rr.Hdr.Name].Port = int(rr.Port)
@@ -248,6 +257,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					}
 					entries[rr.Hdr.Name].Text = rr.Txt
 					entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
+					entries[rr.Hdr.Name].TrueAddr = msg.Addr
 				}
 			}
 			// Associate IPs in a second round as other fields should be filled by now.
@@ -314,7 +324,7 @@ func (c *client) shutdown() {
 
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
 // structures and sends them to a given msgCh channel
-func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
+func (c *client) recv(ctx context.Context, l interface{}, msgCh chan ClientMsg) {
 	var readFrom func([]byte) (n int, src net.Addr, err error)
 
 	switch pConn := l.(type) {
@@ -344,7 +354,7 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 			return
 		}
 
-		n, _, err := readFrom(buf)
+		n, src, err := readFrom(buf)
 		if err != nil {
 			fatalErr = err
 			continue
@@ -355,7 +365,10 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 			continue
 		}
 		select {
-		case msgCh <- msg:
+		case msgCh <- ClientMsg{
+			Msg:  msg,
+			Addr: src,
+		}:
 			// Submit decoded DNS message and continue.
 		case <-ctx.Done():
 			// Abort.
